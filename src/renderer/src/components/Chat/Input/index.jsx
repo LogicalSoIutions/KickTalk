@@ -27,16 +27,17 @@ import { ContentEditable } from "@lexical/react/LexicalContentEditable";
 import { HistoryPlugin } from "@lexical/react/LexicalHistoryPlugin";
 import { LexicalErrorBoundary } from "@lexical/react/LexicalErrorBoundary";
 import { useLexicalComposerContext } from "@lexical/react/LexicalComposerContext";
-import { $rootTextContent } from "@lexical/text";
 import useChatStore from "../../../providers/ChatProvider";
 
 import EmoteDialogs from "./EmoteDialogs";
+import { useAccessibleKickEmotes } from "./useAccessibleKickEmotes";
 import { useShallow } from "zustand/react/shallow";
 import { $isEmoteNode, EmoteNode } from "./EmoteNode";
 import { kickEmoteInputRegex } from "../../../../../../utils/constants";
 import XIcon from "../../../assets/icons/x-bold.svg?asset";
 import LockIcon from "../../../assets/icons/lock-simple-fill.svg?asset";
 import InfoBar from "./InfoBar";
+import FavoriteEmotes from "./FavoriteEmotes";
 
 const onError = (error) => {
   console.error(error);
@@ -48,7 +49,64 @@ const theme = {
   placeholder: "editor-placeholder",
 };
 
+const slashCommands = [
+  { name: "user", description: "Open a user's profile card" },
+  { name: "ban", description: "Ban a user" },
+  { name: "timeout", description: "Timeout a user (e.g. 10, 1h, 1d, 1w)" },
+  { name: "unban", description: "Unban a user" },
+  { name: "untimeout", description: "Remove a user's timeout" },
+];
+
 const messageHistory = new Map();
+const timeoutDurationRegex = /^(\d+)([mhdw])?$/i;
+const timeoutUnitToMinutes = {
+  m: 1,
+  h: 60,
+  d: 1440,
+  w: 10080,
+};
+
+const parseTimeoutDurationToMinutes = (durationInput) => {
+  if (typeof durationInput !== "string") return null;
+
+  const trimmedDuration = durationInput.trim();
+  const match = timeoutDurationRegex.exec(trimmedDuration);
+  if (!match) return null;
+
+  const durationValue = Number.parseInt(match[1], 10);
+  if (!Number.isFinite(durationValue) || durationValue < 1) return null;
+
+  const durationUnit = (match[2] || "m").toLowerCase();
+  const minuteMultiplier = timeoutUnitToMinutes[durationUnit];
+  if (!minuteMultiplier) return null;
+
+  const durationMinutes = durationValue * minuteMultiplier;
+  if (!Number.isSafeInteger(durationMinutes) || durationMinutes < 1) return null;
+
+  return durationMinutes;
+};
+
+const getActiveTriggerAtCursor = (textContent, cursorOffset) => {
+  if (typeof textContent !== "string") return null;
+  if (!Number.isInteger(cursorOffset) || cursorOffset < 0) return null;
+
+  const textBeforeCursor = textContent.slice(0, cursorOffset);
+  const triggerMatch = textBeforeCursor.match(/(?:^|\s)([:@/])([^\s]*)$/);
+  if (!triggerMatch) return null;
+
+  const trigger = triggerMatch[1];
+  const query = triggerMatch[2] || "";
+  const start = cursorOffset - query.length - 1;
+
+  if (start < 0 || textContent[start] !== trigger) return null;
+
+  return {
+    trigger,
+    query,
+    start,
+    end: cursorOffset,
+  };
+};
 
 const EmoteSuggestions = memo(
   ({ suggestions, onSelect, selectedIndex, userChatroomInfo }) => {
@@ -67,23 +125,38 @@ const EmoteSuggestions = memo(
     if (!suggestions?.length) return null;
 
     return (
-      <div className={clsx("inputSuggestionsWrapper", suggestions?.length && "show")} ref={suggestionsRef}>
+      <div
+        className={clsx(
+          "inputSuggestionsWrapper",
+          suggestions?.length && "show",
+        )}
+        ref={suggestionsRef}
+      >
         <div className="inputSuggestions">
           {suggestions?.map((emote, i) => {
             return (
               <div
                 key={`${emote.id}-${emote.alias}`}
                 ref={selectedIndex === i ? selectedSuggestionRef : null}
-                disabled={emote?.subscribers_only && !userChatroomInfo?.subscription}
+                disabled={
+                  emote?.subscribers_only && !userChatroomInfo?.subscription
+                }
                 className={clsx(
                   "inputSuggestion",
                   selectedIndex === i && "selected",
-                  emote?.subscribers_only && !userChatroomInfo?.subscription && "emoteItemSubscriberOnly",
+                  emote?.subscribers_only &&
+                    !userChatroomInfo?.subscription &&
+                    "emoteItemSubscriberOnly",
                 )}
                 onClick={() => {
-                  if (emote?.subscribers_only && !userChatroomInfo?.subscription) return;
+                  if (
+                    emote?.subscribers_only &&
+                    !userChatroomInfo?.subscription
+                  )
+                    return;
                   onSelect(emote);
-                }}>
+                }}
+              >
                 <div className="inputSuggestionImage">
                   <img
                     className="emote"
@@ -100,11 +173,17 @@ const EmoteSuggestions = memo(
                     fetchpriority="low"
                     decoding="async"
                   />
-                  {emote?.subscribers_only && !userChatroomInfo?.subscription && (
-                    <div className="emoteItemSubscriberLock">
-                      <img src={LockIcon} alt="Subscriber" width={16} height={16} />
-                    </div>
-                  )}
+                  {emote?.subscribers_only &&
+                    !userChatroomInfo?.subscription && (
+                      <div className="emoteItemSubscriberLock">
+                        <img
+                          src={LockIcon}
+                          alt="Subscriber"
+                          width={16}
+                          height={16}
+                        />
+                      </div>
+                    )}
                 </div>
                 <div className="inputSuggestionInfo">
                   <span>{emote?.name}</span>
@@ -149,17 +228,27 @@ const ChatterSuggestions = memo(
     if (!suggestions?.length) return null;
 
     return (
-      <div className={clsx("inputSuggestionsWrapper", suggestions?.length && "show")} ref={suggestionsRef}>
+      <div
+        className={clsx(
+          "inputSuggestionsWrapper",
+          suggestions?.length && "show",
+        )}
+        ref={suggestionsRef}
+      >
         <div className="inputSuggestions">
           {suggestions.map((chatter, i) => {
             return (
               <div
                 key={chatter?.id}
                 ref={selectedIndex === i ? selectedSuggestionRef : null}
-                className={clsx("inputSuggestion", selectedIndex === i && "selected")}
+                className={clsx(
+                  "inputSuggestion",
+                  selectedIndex === i && "selected",
+                )}
                 onClick={() => {
                   onSelect(chatter);
-                }}>
+                }}
+              >
                 <div className="inputSuggestionInfo">
                   <span>{chatter?.username}</span>
                 </div>
@@ -171,14 +260,84 @@ const ChatterSuggestions = memo(
     );
   },
   (prevProps, nextProps) => {
-    return prevProps.selectedIndex === nextProps.selectedIndex && prevProps.suggestions === nextProps.suggestions;
+    return (
+      prevProps.selectedIndex === nextProps.selectedIndex &&
+      prevProps.suggestions === nextProps.suggestions
+    );
   },
 );
 
-const KeyHandler = ({ chatroomId, onSendMessage, replyInputData, setReplyInputData, isReplyThread, allStvEmotes }) => {
+const CommandSuggestions = memo(
+  ({ suggestions, onSelect, selectedIndex }) => {
+    const suggestionsRef = useRef(null);
+    const selectedSuggestionRef = useRef(null);
+
+    useEffect(() => {
+      if (!suggestionsRef.current) return;
+
+      const selectedElement = selectedSuggestionRef.current;
+      if (!selectedElement) return;
+
+      selectedElement.scrollIntoView({ block: "center", behavior: "instant" });
+    }, [selectedIndex]);
+
+    if (!suggestions?.length) return null;
+
+    return (
+      <div
+        className={clsx(
+          "inputSuggestionsWrapper",
+          suggestions?.length && "show",
+        )}
+        ref={suggestionsRef}
+      >
+        <div className="inputSuggestions">
+          {suggestions.map((command, i) => {
+            return (
+              <div
+                key={command?.name}
+                ref={selectedIndex === i ? selectedSuggestionRef : null}
+                className={clsx(
+                  "inputSuggestion",
+                  selectedIndex === i && "selected",
+                )}
+                onClick={() => {
+                  onSelect(command);
+                }}
+              >
+                <div className="inputSuggestionInfo">
+                  <span>/{command?.name}</span>
+                  <div className="emoteTags">
+                    <span>{command?.description}</span>
+                  </div>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    );
+  },
+  (prevProps, nextProps) => {
+    return (
+      prevProps.selectedIndex === nextProps.selectedIndex &&
+      prevProps.suggestions === nextProps.suggestions
+    );
+  },
+);
+
+const KeyHandler = ({
+  chatroomId,
+  onSendMessage,
+  replyInputData,
+  setReplyInputData,
+  isReplyThread,
+  allStvEmotes,
+}) => {
   const [editor] = useLexicalComposerContext();
   const [emoteSuggestions, setEmoteSuggestions] = useState([]);
   const [chatterSuggestions, setChatterSuggestions] = useState([]);
+  const [commandSuggestions, setCommandSuggestions] = useState([]);
   const [searchText, setSearchText] = useState("");
   const [tabSuggestions, setTabSuggestions] = useState([]);
   const [selectedTabIndex, setSelectedTabIndex] = useState(0);
@@ -186,8 +345,12 @@ const KeyHandler = ({ chatroomId, onSendMessage, replyInputData, setReplyInputDa
   // const [showChatters, setShowChatters] = useState(false);
   const [selectedEmoteIndex, setSelectedEmoteIndex] = useState(0);
   const [selectedChatterIndex, setSelectedChatterIndex] = useState(0);
+  const [selectedCommandIndex, setSelectedCommandIndex] = useState(0);
   const [position, setPosition] = useState(null);
-  const [tabCycleInfo, setTabCycleInfo] = useState({ originalWord: "", emoteNodeKey: null });
+  const [tabCycleInfo, setTabCycleInfo] = useState({
+    originalWord: "",
+    emoteNodeKey: null,
+  });
 
   const resetTabSuggestions = () => {
     setTabSuggestions([]);
@@ -195,10 +358,16 @@ const KeyHandler = ({ chatroomId, onSendMessage, replyInputData, setReplyInputDa
   };
 
   const userChatroomInfo = useChatStore(
-    useShallow((state) => state.chatrooms.find((room) => room.id === chatroomId)?.userChatroomInfo),
+    useShallow(
+      (state) =>
+        state.chatrooms.find((room) => room.id === chatroomId)
+          ?.userChatroomInfo,
+    ),
   );
-  const chatters = useChatStore(useShallow((state) => state.chatters[chatroomId]));
-  const kickEmotes = useChatStore(useShallow((state) => state.chatrooms.find((room) => room.id === chatroomId)?.emotes));
+  const chatters = useChatStore(
+    useShallow((state) => state.chatters[chatroomId]),
+  );
+  const kickEmotes = useAccessibleKickEmotes(chatroomId);
 
   const searchEmotes = useCallback(
     (text) => {
@@ -208,12 +377,18 @@ const KeyHandler = ({ chatroomId, onSendMessage, replyInputData, setReplyInputDa
       const sevenTvResults =
         allStvEmotes
           ?.flatMap((emoteSet) => emoteSet.emotes)
-          ?.filter((emote) => emote.name.toLowerCase().includes(transformedText)) || [];
+          ?.filter((emote) =>
+            emote.name.toLowerCase().includes(transformedText),
+          ) || [];
 
       const kickResults =
         kickEmotes
           ?.flatMap((emoteSet) => emoteSet.emotes || [])
-          ?.filter((emote) => emote.name.toLowerCase().includes(transformedText)) || [];
+          ?.filter(
+            (emote) =>
+              emote.__allowUse !== false &&
+              emote.name.toLowerCase().includes(transformedText),
+          ) || [];
 
       const allResults = [...sevenTvResults, ...kickResults];
 
@@ -225,8 +400,16 @@ const KeyHandler = ({ chatroomId, onSendMessage, replyInputData, setReplyInputDa
         if (aName === transformedText && bName !== transformedText) return -1;
         if (bName === transformedText && aName !== transformedText) return 1;
 
-        if (aName.startsWith(transformedText) && !bName.startsWith(transformedText)) return -1;
-        if (bName.startsWith(transformedText) && !aName.startsWith(transformedText)) return 1;
+        if (
+          aName.startsWith(transformedText) &&
+          !bName.startsWith(transformedText)
+        )
+          return -1;
+        if (
+          bName.startsWith(transformedText) &&
+          !aName.startsWith(transformedText)
+        )
+          return 1;
 
         return aName.localeCompare(bName);
       });
@@ -240,11 +423,44 @@ const KeyHandler = ({ chatroomId, onSendMessage, replyInputData, setReplyInputDa
     (text) => {
       if (!text) return [];
       const transformedText = text.toLowerCase();
+      const uniqueChatters = [];
+      const seenUsernames = new Set();
 
-      return chatters?.filter((chatter) => chatter.username.toLowerCase().includes(transformedText))?.slice(0, 10) || [];
+      for (const chatter of chatters || []) {
+        const username = chatter?.username?.toLowerCase();
+        if (!username || seenUsernames.has(username)) continue;
+        seenUsernames.add(username);
+        uniqueChatters.push(chatter);
+      }
+
+      const prefixMatches = uniqueChatters.filter((chatter) =>
+        chatter.username.toLowerCase().startsWith(transformedText),
+      );
+      const includesMatches = uniqueChatters.filter(
+        (chatter) =>
+          !chatter.username.toLowerCase().startsWith(transformedText) &&
+          chatter.username.toLowerCase().includes(transformedText),
+      );
+
+      return [...prefixMatches, ...includesMatches].slice(0, 6);
     },
     [chatters],
   );
+
+  const searchCommands = useCallback((text) => {
+    const transformedText = text.toLowerCase();
+
+    const prefixMatches = slashCommands.filter((command) =>
+      command.name.toLowerCase().startsWith(transformedText),
+    );
+    const includesMatches = slashCommands.filter(
+      (command) =>
+        !command.name.toLowerCase().startsWith(transformedText) &&
+        command.name.toLowerCase().includes(transformedText),
+    );
+
+    return [...prefixMatches, ...includesMatches].slice(0, 10);
+  }, []);
 
   const insertEmote = useCallback(
     (emote) => {
@@ -255,11 +471,11 @@ const KeyHandler = ({ chatroomId, onSendMessage, replyInputData, setReplyInputDa
         const node = selection.anchor.getNode();
         const textContent = node.getTextContent();
         const cursorOffset = selection.anchor.offset;
-        const colonIndex = textContent.indexOf(":");
-        if (colonIndex === -1) return;
+        const activeTrigger = getActiveTriggerAtCursor(textContent, cursorOffset);
+        if (!activeTrigger || activeTrigger.trigger !== ":") return;
 
-        const textBefore = textContent.slice(0, colonIndex);
-        const textAfter = textContent.slice(cursorOffset);
+        const textBefore = textContent.slice(0, activeTrigger.start);
+        const textAfter = textContent.slice(activeTrigger.end);
         node.setTextContent(textBefore);
 
         if (!emote?.platform) return;
@@ -290,13 +506,11 @@ const KeyHandler = ({ chatroomId, onSendMessage, replyInputData, setReplyInputDa
 
         const textContent = node.getTextContent();
         const cursorOffset = selection.anchor.offset;
+        const activeTrigger = getActiveTriggerAtCursor(textContent, cursorOffset);
+        if (!activeTrigger || activeTrigger.trigger !== "@") return;
 
-        // Find last '@' before cursor
-        const atIndex = textContent.lastIndexOf("@", cursorOffset);
-        if (atIndex === -1) return;
-
-        const textBefore = textContent.slice(0, atIndex);
-        const textAfter = textContent.slice(cursorOffset);
+        const textBefore = textContent.slice(0, activeTrigger.start);
+        const textAfter = textContent.slice(activeTrigger.end);
 
         // Replace node text up to '@'
         node.setTextContent(textBefore);
@@ -319,6 +533,39 @@ const KeyHandler = ({ chatroomId, onSendMessage, replyInputData, setReplyInputDa
     [editor],
   );
 
+  const insertSlashCommand = useCallback(
+    (command) => {
+      editor.update(() => {
+        const selection = $getSelection();
+        if (!$isRangeSelection(selection)) return;
+
+        const node = selection.anchor.getNode();
+        if (!node) return;
+
+        const textContent = node.getTextContent();
+        const cursorOffset = selection.anchor.offset;
+        const activeTrigger = getActiveTriggerAtCursor(textContent, cursorOffset);
+        if (!activeTrigger || activeTrigger.trigger !== "/") return;
+
+        const textBeforeSlash = textContent.slice(0, activeTrigger.start);
+        const textAfterCursor = textContent.slice(activeTrigger.end);
+
+        node.setTextContent(textBeforeSlash);
+        selection.insertNodes([$createTextNode(`/${command.name} `)]);
+
+        if (textAfterCursor) {
+          selection.insertNodes([$createTextNode(textAfterCursor)]);
+        }
+      });
+
+      setCommandSuggestions([]);
+      setSearchText("");
+      setSelectedCommandIndex(null);
+      setPosition(null);
+    },
+    [editor],
+  );
+
   useEffect(() => {
     if (!editor) return;
 
@@ -328,19 +575,33 @@ const KeyHandler = ({ chatroomId, onSendMessage, replyInputData, setReplyInputDa
         (e) => {
           e.preventDefault();
           if (emoteSuggestions?.length) {
-            setSelectedEmoteIndex((prev) => (prev <= 0 ? emoteSuggestions.length - 1 : prev - 1));
+            setSelectedEmoteIndex((prev) =>
+              prev <= 0 ? emoteSuggestions.length - 1 : prev - 1,
+            );
             return true;
           }
 
           if (chatterSuggestions?.length) {
-            setSelectedChatterIndex((prev) => (prev <= 0 ? chatterSuggestions.length - 1 : prev - 1));
+            setSelectedChatterIndex((prev) =>
+              prev <= 0 ? chatterSuggestions.length - 1 : prev - 1,
+            );
+            return true;
+          }
+
+          if (commandSuggestions?.length) {
+            setSelectedCommandIndex((prev) =>
+              prev <= 0 ? commandSuggestions.length - 1 : prev - 1,
+            );
             return true;
           }
 
           const history = messageHistory.get(chatroomId);
           if (!history?.sentMessages?.length) return false;
 
-          const currentIndex = history.selectedIndex !== undefined ? history.selectedIndex - 1 : history.sentMessages.length - 1;
+          const currentIndex =
+            history.selectedIndex !== undefined
+              ? history.selectedIndex - 1
+              : history.sentMessages.length - 1;
           if (currentIndex < 0) return false;
 
           messageHistory.set(chatroomId, {
@@ -369,19 +630,37 @@ const KeyHandler = ({ chatroomId, onSendMessage, replyInputData, setReplyInputDa
         (e) => {
           e.preventDefault();
           if (emoteSuggestions?.length) {
-            setSelectedEmoteIndex((prev) => (prev === null || prev >= emoteSuggestions.length - 1 ? 0 : prev + 1));
+            setSelectedEmoteIndex((prev) =>
+              prev === null || prev >= emoteSuggestions.length - 1
+                ? 0
+                : prev + 1,
+            );
             return true;
           }
 
           if (chatterSuggestions?.length) {
-            setSelectedChatterIndex((prev) => (prev === null || prev >= chatterSuggestions.length - 1 ? 0 : prev + 1));
+            setSelectedChatterIndex((prev) =>
+              prev === null || prev >= chatterSuggestions.length - 1
+                ? 0
+                : prev + 1,
+            );
+            return true;
+          }
+
+          if (commandSuggestions?.length) {
+            setSelectedCommandIndex((prev) =>
+              prev === null || prev >= commandSuggestions.length - 1
+                ? 0
+                : prev + 1,
+            );
             return true;
           }
 
           const history = messageHistory.get(chatroomId);
           if (!history?.sentMessages?.length) return false;
 
-          const currentIndex = history.selectedIndex >= 0 ? history.selectedIndex + 1 : 0;
+          const currentIndex =
+            history.selectedIndex >= 0 ? history.selectedIndex + 1 : 0;
           if (currentIndex > history.sentMessages.length) return false;
 
           messageHistory.set(chatroomId, {
@@ -408,43 +687,59 @@ const KeyHandler = ({ chatroomId, onSendMessage, replyInputData, setReplyInputDa
       editor.registerCommand(
         KEY_ENTER_COMMAND,
         (e) => {
-          if (e.shiftKey) return false;
-          e.preventDefault();
+          try {
+            if (e?.shiftKey) return false;
+            e?.preventDefault?.();
+            e?.stopPropagation?.();
 
-          if (emoteSuggestions?.length > 0) {
-            const emote = emoteSuggestions[selectedEmoteIndex];
-            if (emote?.subscribers_only && !userChatroomInfo?.subscription) return false;
+            if (emoteSuggestions?.length > 0) {
+              const emote = emoteSuggestions[selectedEmoteIndex ?? 0];
+              if (emote?.subscribers_only && !userChatroomInfo?.subscription)
+                return false;
 
-            insertEmote(emote);
+              insertEmote(emote);
+              return true;
+            }
+
+            if (chatterSuggestions?.length > 0) {
+              insertChatterMention(
+                chatterSuggestions[selectedChatterIndex ?? 0],
+              );
+              return true;
+            }
+
+            if (commandSuggestions?.length > 0) {
+              insertSlashCommand(commandSuggestions[selectedCommandIndex ?? 0]);
+              return true;
+            }
+
+            let content = "";
+            editor.getEditorState().read(() => {
+              content = $getRoot().getTextContent();
+            });
+
+            if (!content.trim()) return true;
+
+            onSendMessage(content);
+
+            editor.update(() => {
+              if (!e?.ctrlKey && !e?.metaKey) $getRoot().clear();
+            });
+
+            // Close reply input if open after entering message
+            if (replyInputData) {
+              setReplyInputData(null);
+            }
+
             return true;
+          } catch (error) {
+            return false;
           }
-
-          if (chatterSuggestions?.length > 0) {
-            insertChatterMention(chatterSuggestions[selectedChatterIndex]);
-            return true;
-          }
-
-          const content = $rootTextContent();
-          if (!content.trim()) return true;
-
-          onSendMessage(content);
-
-          editor.update(() => {
-            if (!e.ctrlKey) $getRoot().clear();
-          });
-
-          // Close reply input if open after entering message
-          if (replyInputData) {
-            setReplyInputData(null);
-          }
-
-          return true;
         },
-        COMMAND_PRIORITY_HIGH,
+        COMMAND_PRIORITY_CRITICAL,
       ),
 
       ...[
-        [KEY_ENTER_COMMAND, COMMAND_PRIORITY_CRITICAL],
         [KEY_SPACE_COMMAND, COMMAND_PRIORITY_CRITICAL],
         [KEY_BACKSPACE_COMMAND, COMMAND_PRIORITY_CRITICAL],
       ].map(([command, priority]) =>
@@ -471,20 +766,31 @@ const KeyHandler = ({ chatroomId, onSendMessage, replyInputData, setReplyInputDa
             insertChatterMention(chatterSuggestions[selectedChatterIndex]);
             return true;
           }
+          if (commandSuggestions?.length) {
+            insertSlashCommand(commandSuggestions[selectedCommandIndex]);
+            return true;
+          }
           const selection = $getSelection();
           if (!$isRangeSelection(selection)) return false;
           const anchorNode = selection.anchor.getNode();
           if (!anchorNode) return false;
           editor.update(() => {
             if (tabSuggestions?.length && tabCycleInfo?.emoteNodeKey) {
-              const previousEmoteNode = $getNodeByKey(tabCycleInfo.emoteNodeKey);
+              const previousEmoteNode = $getNodeByKey(
+                tabCycleInfo.emoteNodeKey,
+              );
               if (previousEmoteNode && previousEmoteNode.__type === "emote") {
                 previousEmoteNode.remove();
-                const nextIndex = (selectedTabIndex + 1) % tabSuggestions.length;
+                const nextIndex =
+                  (selectedTabIndex + 1) % tabSuggestions.length;
                 setSelectedTabIndex(nextIndex);
                 const nextEmote = tabSuggestions[nextIndex];
                 if (nextEmote?.id && nextEmote?.platform) {
-                  const newEmoteNode = new EmoteNode(nextEmote.id, nextEmote.name, nextEmote.platform);
+                  const newEmoteNode = new EmoteNode(
+                    nextEmote.id,
+                    nextEmote.name,
+                    nextEmote.platform,
+                  );
                   selection.insertNodes([newEmoteNode]);
                   setTabCycleInfo((prev) => ({
                     ...prev,
@@ -506,8 +812,9 @@ const KeyHandler = ({ chatroomId, onSendMessage, replyInputData, setReplyInputDa
             const emotesA = allStvEmotes[0]?.emotes ?? [];
             const emotesB = allStvEmotes[1]?.emotes ?? [];
             const emotesC = allStvEmotes[2]?.emotes ?? [];
-            const foundEmotes = [...emotesA, ...emotesB, ...emotesC].filter((emote) =>
-              emote.name.toLowerCase().startsWith(currentWord.toLowerCase()),
+            const foundEmotes = [...emotesA, ...emotesB, ...emotesC].filter(
+              (emote) =>
+                emote.name.toLowerCase().startsWith(currentWord.toLowerCase()),
             );
 
             if (foundEmotes.length > 0) {
@@ -520,7 +827,11 @@ const KeyHandler = ({ chatroomId, onSendMessage, replyInputData, setReplyInputDa
               setTabSuggestions(foundEmotes);
               setSelectedTabIndex(0);
               if (emote?.id && emote?.platform) {
-                const emoteNode = new EmoteNode(emote.id, emote.name, emote.platform);
+                const emoteNode = new EmoteNode(
+                  emote.id,
+                  emote.name,
+                  emote.platform,
+                );
                 selection.insertNodes([emoteNode]);
                 setTabCycleInfo({
                   originalWord: currentWord,
@@ -578,31 +889,49 @@ const KeyHandler = ({ chatroomId, onSendMessage, replyInputData, setReplyInputDa
           const node = selection.anchor.getNode();
           const textContent = node.getTextContent();
           const cursorOffset = selection.anchor.offset;
+          const activeTrigger = getActiveTriggerAtCursor(textContent, cursorOffset);
 
-          const textBeforeCursor = textContent.slice(0, cursorOffset);
-          const words = textBeforeCursor.split(/\s+/);
-          const currentWord = words[words.length - 1];
-
-          if (currentWord.startsWith(":")) {
-            const query = currentWord.slice(1);
+          if (activeTrigger?.trigger === ":") {
+            const query = activeTrigger.query;
             const results = searchEmotes(query);
             setSearchText(query);
             setEmoteSuggestions(results);
+            setChatterSuggestions([]);
+            setCommandSuggestions([]);
             setSelectedEmoteIndex(0);
-            setPosition([cursorOffset - query.length, cursorOffset]);
-          } else if (currentWord.startsWith("@")) {
-            const query = currentWord.slice(1);
+            setSelectedChatterIndex(null);
+            setSelectedCommandIndex(null);
+            setPosition([activeTrigger.start, activeTrigger.end]);
+          } else if (activeTrigger?.trigger === "@") {
+            const query = activeTrigger.query;
             const results = searchChatters(query);
             setSearchText(query);
+            setEmoteSuggestions([]);
             setChatterSuggestions(results?.length ? results : null);
+            setCommandSuggestions([]);
+            setSelectedEmoteIndex(null);
             setSelectedChatterIndex(0);
-            setPosition([cursorOffset - query.length, cursorOffset]);
+            setSelectedCommandIndex(null);
+            setPosition([activeTrigger.start, activeTrigger.end]);
+          } else if (activeTrigger?.trigger === "/") {
+            const query = activeTrigger.query;
+            const results = searchCommands(query);
+            setSearchText(query);
+            setEmoteSuggestions([]);
+            setChatterSuggestions([]);
+            setCommandSuggestions(results?.length ? results : null);
+            setSelectedEmoteIndex(null);
+            setSelectedChatterIndex(null);
+            setSelectedCommandIndex(0);
+            setPosition([activeTrigger.start, activeTrigger.end]);
           } else {
             setEmoteSuggestions([]);
             setChatterSuggestions([]);
+            setCommandSuggestions([]);
             setSearchText("");
             setSelectedEmoteIndex(null);
             setSelectedChatterIndex(null);
+            setSelectedCommandIndex(null);
             setPosition(null);
           }
         });
@@ -663,14 +992,23 @@ const KeyHandler = ({ chatroomId, onSendMessage, replyInputData, setReplyInputDa
     editor,
     searchEmotes,
     searchChatters,
+    searchCommands,
     emoteSuggestions,
     chatterSuggestions,
+    commandSuggestions,
     chatters,
     selectedEmoteIndex,
     selectedChatterIndex,
+    selectedCommandIndex,
     insertEmote,
     insertChatterMention,
+    insertSlashCommand,
     isReplyThread,
+    onSendMessage,
+    replyInputData,
+    setReplyInputData,
+    userChatroomInfo,
+    chatroomId,
   ]);
 
   useEffect(() => {
@@ -693,6 +1031,76 @@ const KeyHandler = ({ chatroomId, onSendMessage, replyInputData, setReplyInputDa
     };
   }, [editor]);
 
+  useEffect(() => {
+    if (!editor) return;
+
+    const handleWindowEnterFallback = (e) => {
+      if (e.key !== "Enter" || e.shiftKey || e.defaultPrevented) return;
+      const root = editor.getRootElement();
+      const target = e.target;
+      if (!root || !(target instanceof Node) || !root.contains(target)) return;
+
+      e.preventDefault();
+      e.stopPropagation();
+      e.stopImmediatePropagation?.();
+
+      if (emoteSuggestions?.length > 0) {
+        const emote = emoteSuggestions[selectedEmoteIndex ?? 0];
+        if (emote?.subscribers_only && !userChatroomInfo?.subscription) return;
+        insertEmote(emote);
+        return;
+      }
+
+      if (chatterSuggestions?.length > 0) {
+        insertChatterMention(chatterSuggestions[selectedChatterIndex ?? 0]);
+        return;
+      }
+
+      if (commandSuggestions?.length > 0) {
+        insertSlashCommand(commandSuggestions[selectedCommandIndex ?? 0]);
+        return;
+      }
+
+      let content = "";
+      editor.getEditorState().read(() => {
+        content = $getRoot().getTextContent();
+      });
+
+      if (!content.trim()) return;
+
+      onSendMessage(content);
+
+      editor.update(() => {
+        if (!e.ctrlKey && !e.metaKey) $getRoot().clear();
+      });
+
+      if (replyInputData) {
+        setReplyInputData(null);
+      }
+    };
+
+    window.addEventListener("keydown", handleWindowEnterFallback, true);
+
+    return () => {
+      window.removeEventListener("keydown", handleWindowEnterFallback, true);
+    };
+  }, [
+    editor,
+    emoteSuggestions,
+    chatterSuggestions,
+    commandSuggestions,
+    onSendMessage,
+    replyInputData,
+    setReplyInputData,
+    insertEmote,
+    insertChatterMention,
+    insertSlashCommand,
+    selectedEmoteIndex,
+    selectedChatterIndex,
+    selectedCommandIndex,
+    userChatroomInfo,
+  ]);
+
   return (
     <>
       <EmoteSuggestions
@@ -703,7 +1111,16 @@ const KeyHandler = ({ chatroomId, onSendMessage, replyInputData, setReplyInputDa
         userChatroomInfo={userChatroomInfo}
       />
 
-      <ChatterSuggestions suggestions={chatterSuggestions} selectedIndex={selectedChatterIndex} onSelect={insertChatterMention} />
+      <ChatterSuggestions
+        suggestions={chatterSuggestions}
+        selectedIndex={selectedChatterIndex}
+        onSelect={insertChatterMention}
+      />
+      <CommandSuggestions
+        suggestions={commandSuggestions}
+        selectedIndex={selectedCommandIndex}
+        onSelect={insertSlashCommand}
+      />
     </>
   );
 };
@@ -718,8 +1135,8 @@ const processEmoteInput = ({ node, kickEmotes }) => {
     if (!emoteName) continue;
 
     const emote = kickEmotes
-      ?.find((set) => set?.emotes?.find((e) => e.name === emoteName))
-      ?.emotes?.find((e) => e.name === emoteName);
+      ?.find((set) => set?.emotes?.find((e) => e.name === emoteName && e.__allowUse !== false))
+      ?.emotes?.find((e) => e.name === emoteName && e.__allowUse !== false);
 
     if (emote) {
       matches.push({
@@ -754,7 +1171,7 @@ const processEmoteInput = ({ node, kickEmotes }) => {
 
 const EmoteTransformer = ({ chatroomId }) => {
   const [editor] = useLexicalComposerContext();
-  const kickEmotes = useChatStore(useShallow((state) => state.chatrooms.find((room) => room.id === chatroomId)?.emotes));
+  const kickEmotes = useAccessibleKickEmotes(chatroomId);
 
   useEffect(() => {
     if (!editor) return;
@@ -765,8 +1182,10 @@ const EmoteTransformer = ({ chatroomId }) => {
   }, [editor, kickEmotes]);
 };
 
-const EmoteHandler = ({ chatroomId, userChatroomInfo }) => {
+const EmoteHandler = ({ chatroomId, userChatroomInfo, onSendFavorite }) => {
   const [editor] = useLexicalComposerContext();
+  const favoriteEmotes = useChatStore(useShallow((state) => state.favoriteEmotes));
+  const toggleFavoriteEmote = useChatStore((state) => state.toggleFavoriteEmote);
 
   const handleEmoteClick = (emote) => {
     editor.focus();
@@ -781,7 +1200,23 @@ const EmoteHandler = ({ chatroomId, userChatroomInfo }) => {
     });
   };
 
-  return <EmoteDialogs chatroomId={chatroomId} handleEmoteClick={handleEmoteClick} userChatroomInfo={userChatroomInfo} />;
+  return (
+    <>
+      <FavoriteEmotes
+        favoriteEmotes={favoriteEmotes}
+        onInsert={handleEmoteClick}
+        onSend={onSendFavorite}
+        onToggleFavorite={toggleFavoriteEmote}
+      />
+      <EmoteDialogs
+        chatroomId={chatroomId}
+        handleEmoteClick={handleEmoteClick}
+        userChatroomInfo={userChatroomInfo}
+        favoriteEmotes={favoriteEmotes}
+        onToggleFavorite={toggleFavoriteEmote}
+      />
+    </>
+  );
 };
 
 const initialConfig = {
@@ -800,13 +1235,21 @@ const ReplyHandler = ({ chatroomId, replyInputData, setReplyInputData }) => {
   return (
     <>
       {replyInputData && (
-        <div className={clsx("replyInputContainer", replyInputData?.sender?.id && "show")}>
+        <div
+          className={clsx(
+            "replyInputContainer",
+            replyInputData?.sender?.id && "show",
+          )}
+        >
           <div className="replyInputBoxHead">
             <span>
               Replying to <b>@{replyInputData?.sender?.username}</b>
             </span>
 
-            <button className="replyInputCloseButton" onClick={() => setReplyInputData(null)}>
+            <button
+              className="replyInputCloseButton"
+              onClick={() => setReplyInputData(null)}
+            >
               <img src={XIcon} alt="Close" width={16} height={16} />
             </button>
           </div>
@@ -823,12 +1266,21 @@ const ChatInput = memo(
   ({ chatroomId, isReplyThread = false, replyMessage = {}, settings }) => {
     const sendMessage = useChatStore((state) => state.sendMessage);
     const sendReply = useChatStore((state) => state.sendReply);
-    const chatroom = useChatStore(useShallow((state) => state.chatrooms.find((room) => room.id === chatroomId)));
-    const personalEmoteSets = useChatStore(useShallow((state) => state.personalEmoteSets));
+    const chatroom = useChatStore(
+      useShallow((state) =>
+        state.chatrooms.find((room) => room.id === chatroomId),
+      ),
+    );
+    const personalEmoteSets = useChatStore(
+      useShallow((state) => state.personalEmoteSets),
+    );
     const [replyInputData, setReplyInputData] = useState(null);
 
     const allStvEmotes = useMemo(() => {
-      return [...(personalEmoteSets || []), ...(chatroom?.channel7TVEmotes || [])];
+      return [
+        ...(personalEmoteSets || []),
+        ...(chatroom?.channel7TVEmotes || []),
+      ];
     }, [personalEmoteSets, chatroom?.channel7TVEmotes]);
 
     // Reset selected index when changing chatrooms
@@ -860,19 +1312,24 @@ const ChatInput = memo(
 
     const handleSendMessage = useCallback(
       async (content) => {
-        if (content.startsWith("/")) {
-          const commandParts = content.slice(1).trim().split(" ");
-          const command = commandParts[0];
-          let usernameInput = commandParts[1];
-          if (!usernameInput) return;
+        const normalizedContent = content.trimStart();
+        if (normalizedContent.startsWith("/")) {
+          const commandParts = normalizedContent
+            .slice(1)
+            .trim()
+            .split(/\s+/)
+            .filter(Boolean);
+          const command = (commandParts[0] || "").toLowerCase();
+          let usernameInput = commandParts[1] || "";
 
-          // Strip out the '@' from the username if it exists
-          if (usernameInput.startsWith("@")) {
-            usernameInput = usernameInput.slice(1);
-          }
+          // Strip out '@' if user includes it.
+          if (usernameInput.startsWith("@")) usernameInput = usernameInput.slice(1);
 
-          if (command) {
-            const user = await window.app.kick.getUserChatroomInfo(chatroom.username, usernameInput);
+          if (command === "user" && usernameInput) {
+            const user = await window.app.kick.getUserChatroomInfo(
+              chatroom.username,
+              usernameInput,
+            );
             if (!user?.data?.id) return;
 
             const sender = {
@@ -893,6 +1350,50 @@ const ChatInput = memo(
 
             return;
           }
+
+          if (command === "ban" && usernameInput) {
+            const moderationChannelName = chatroom?.slug || chatroom?.username;
+            if (!moderationChannelName) return;
+            await window.app.modActions.getBanUser(
+              moderationChannelName,
+              usernameInput,
+            );
+            return;
+          }
+
+          if ((command === "unban" || command === "untimeout") && usernameInput) {
+            const moderationChannelName = chatroom?.slug || chatroom?.username;
+            if (!moderationChannelName) return;
+            await window.app.modActions.getUnbanUser(
+              moderationChannelName,
+              usernameInput,
+            );
+            return;
+          }
+
+          if (command === "timeout" && usernameInput) {
+            let durationInput = commandParts[2];
+
+            // Support both `/timeout user 10` and `/timeout 10 user`.
+            if (timeoutDurationRegex.test(usernameInput) && commandParts[2]) {
+              durationInput = usernameInput;
+              usernameInput = commandParts[2];
+            }
+
+            if (usernameInput.startsWith("@")) usernameInput = usernameInput.slice(1);
+
+            const duration = parseTimeoutDurationToMinutes(durationInput);
+            if (duration === null) return;
+            const moderationChannelName = chatroom?.slug || chatroom?.username;
+            if (!moderationChannelName) return;
+
+            await window.app.modActions.getTimeoutUser(
+              moderationChannelName,
+              usernameInput,
+              duration,
+            );
+            return;
+          }
         }
 
         let res;
@@ -902,7 +1403,9 @@ const ChatInput = memo(
           const metadata = {
             original_message: {
               id: replyInputData?.id || replyMessage?.original_message?.id,
-              content: replyInputData?.content || replyMessage?.original_message?.content,
+              content:
+                replyInputData?.content ||
+                replyMessage?.original_message?.content,
             },
           };
 
@@ -919,19 +1422,36 @@ const ChatInput = memo(
           });
         }
       },
-      [chatroomId, chatroom, sendMessage, replyInputData, setReplyInputData, replyMessage],
+      [
+        chatroomId,
+        chatroom,
+        sendMessage,
+        replyInputData,
+        setReplyInputData,
+        replyMessage,
+      ],
     );
 
     return (
       <div className="chatInputWrapper">
         <div className="chatInputInfoBar">
           {settings?.chatrooms?.showInfoBar && (
-            <InfoBar chatroomInfo={chatroom?.chatroomInfo} initialChatroomInfo={chatroom?.initialChatroomInfo} />
+            <InfoBar
+              chatroomInfo={chatroom?.chatroomInfo}
+              initialChatroomInfo={chatroom?.initialChatroomInfo}
+            />
           )}
-          <ReplyHandler chatroomId={chatroomId} replyInputData={replyInputData} setReplyInputData={setReplyInputData} />
+          <ReplyHandler
+            chatroomId={chatroomId}
+            replyInputData={replyInputData}
+            setReplyInputData={setReplyInputData}
+          />
         </div>
         <div className="chatInputContainer">
-          <LexicalComposer key={`composer-${chatroomId}`} initialConfig={initialConfig}>
+          <LexicalComposer
+            key={`composer-${chatroomId}`}
+            initialConfig={initialConfig}
+          >
             <div className="chatInputBox">
               <PlainTextPlugin
                 contentEditable={
@@ -940,7 +1460,11 @@ const ChatInput = memo(
                       className="chatInput"
                       enterKeyHint="send"
                       aria-placeholder={"Enter message..."}
-                      placeholder={<div className="chatInputPlaceholder">Send a message...</div>}
+                      placeholder={
+                        <div className="chatInputPlaceholder">
+                          Send a message...
+                        </div>
+                      }
                       spellCheck={false}
                     />
                   </div>
@@ -950,14 +1474,21 @@ const ChatInput = memo(
             </div>
 
             <div className={clsx("chatInputActions")}>
-              <EmoteHandler chatroomId={chatroomId} userChatroomInfo={chatroom?.userChatroomInfo} />
+              <EmoteHandler
+                chatroomId={chatroomId}
+                userChatroomInfo={chatroom?.userChatroomInfo}
+                onSendFavorite={handleSendMessage}
+              />
             </div>
             <KeyHandler
               isReplyThread={isReplyThread}
               chatroomId={chatroomId}
               allStvEmotes={allStvEmotes}
               onSendMessage={(content) => {
-                handleSendMessage(content, replyInputData ? "reply" : "message");
+                handleSendMessage(
+                  content,
+                  replyInputData ? "reply" : "message",
+                );
               }}
               replyInputData={replyInputData}
               setReplyInputData={setReplyInputData}
@@ -973,7 +1504,8 @@ const ChatInput = memo(
   (prev, next) =>
     prev.chatroomId === next.chatroomId &&
     prev.replyMessage === next.replyMessage &&
-    prev.settings?.chatrooms?.showInfoBar === next.settings?.chatrooms?.showInfoBar,
+    prev.settings?.chatrooms?.showInfoBar ===
+      next.settings?.chatrooms?.showInfoBar,
 );
 
 export default ChatInput;
